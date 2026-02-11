@@ -1,0 +1,517 @@
+---
+title: "Differential Gene Expression in Septic Shock Patients Based on Response to Early Supportive Hemodynamic Therapy"
+output: 
+  html_notebook:
+    toc: true
+    toc_depth: 2
+    code_folding: show
+bibliography: A1_bib.bib
+---
+
+
+
+By: **Owen Lo**
+```{r message = FALSE, warning = FALSE, class.source = 'fold-hide'}
+# Install and load required packages
+if(!requireNamespace("readxl", quietly = TRUE)) {
+  install.packages("readxl")
+}
+if (!requireNamespace("knitr", quietly = TRUE)) {
+  install.packages("knitr")
+}
+
+library(GEOquery)
+library(tibble)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(biomaRt)
+library(DESeq2)
+library(edgeR)
+library(SummarizedExperiment)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+This workbook uses the GEOQuery [@Davis2007], biomaRt [@Durinck2005], tibble [@Mueller2025], readxl[@Wickham2025], dplyr [@Wickham2023], tidyr[@Wickham2025a], knitr [@Xie2014], DESeq2[@Love2014], edgeR [@Chen2025], SummarizedExperiment[@Morgan2025], ggplot2 [@Wickham2016], ComplexHeatmap [@Gu2022] and circlize [@Gu2014] packages in its code chunks.
+
+# Introduction
+
+Septic shock is a potentially fatal complication of sepsis, and treatment largely depends on early supportive hemodynamic therapy. Patient response to hemodynamic therapy varies, and the NCBI Gene Expression Omnibus (GEO) [@Barrett2012] series GSE110487 is a dataset from 2018 consisting of RNA sequencing read counts of whole blood samples taken from 14 septic shock patients who responded to hemodynamic therapy and 17 non-responders, at two time points: immediately after ICU admission, and 48 hours later, after hemodynamic therapy. [@Barcella2018]
+
+# Fetching and assessing data
+
+## Downloading and formatting
+
+We'll use the GEOQuery package to retrieve the supplementary files and metadata pertaining to the experiment from the GEO with its series accession number, and then look at how it's formatted.
+
+```{r, message = FALSE, warning = FALSE, class.source = 'fold-show'}
+geo_id <- "GSE110487"
+
+# get metadata associated with gse and supplementary files
+gse <- GEOquery::getGEO(geo_id, GSEMatrix=FALSE)
+supp <- GEOquery::getGEOSuppFiles(geo_id, fetch_files=FALSE)
+
+# download data if not already downloaded
+current_dir <- file.path(getwd())
+supp_file_path <- file.path(current_dir, geo_id, supp$fname[1])
+if (!file.exists(supp_file_path)) {
+  data_file <- GEOquery::getGEOSuppFiles(GEO = geo_id)
+}
+
+# read data into a dataframe
+raw_counts <- readxl::read_xlsx(supp_file_path)
+
+# take a peek
+knitr::kable(raw_counts[1:5, 1:10], format = "html", align = "c")
+```
+
+```{r, message = FALSE, warning = FALSE}
+# count genes and samples
+cat(paste("Number of genes: ", nrow(raw_counts),
+          "\nNumber of samples: ", ncol(raw_counts)-1))
+```
+
+Samples in the raw data are named according to patient identity and time point, but don't contain any information on whether the patient was a responder or a non-responder, so we'll map sample identifiers to both response and time point.
+
+```{r, message = FALSE, warning = FALSE}
+# retrieve list of samples in the series, and compile condition data for each
+samples <- gse@gsms
+sample_sources <- do.call(rbind, 
+                             lapply(samples, FUN=function(x){
+                               c(x@header$title,
+                                 x@header$source_name_ch1)}))
+
+# Use this data to create a dataframe mapping sample titles to responder status and time point
+sample_metadata <- as.data.frame(sample_sources, stringsAsFactors = FALSE)
+colnames(sample_metadata) = c("sample", "source")
+sample_metadata <- sample_metadata %>% 
+  magrittr::set_rownames(.$sample) %>% 
+  mutate(
+    response = ifelse(grepl("^Responder", source), "R", "NR"),
+    time_point = ifelse(grepl("T1", source), "T1", "T2"),
+  ) %>% 
+  dplyr::select(response, time_point)
+
+# take a peek
+knitr::kable(sample_metadata[1:5,], format = "html", align = "c")
+```
+
+## Quality assessment
+
+Now, we'll determine whether data quality varies across conditions
+
+```{r, message = FALSE, warning = FALSE}
+# calculating summary statistics for each sample
+sample_summaries <- data.frame(do.call(cbind, lapply(raw_counts[, 2:ncol(raw_counts)], summary)))
+qual_overview <- as.data.frame(t(sample_summaries))
+
+# Adding extra statistics for total reads, number of genes with zero expression, number of genes with low expression
+qual_overview <- qual_overview %>% 
+  dplyr::mutate(total_reads = colSums(raw_counts[2:ncol(raw_counts)]),
+                zero_exp = colSums(raw_counts[2:ncol(raw_counts)] == 0),
+                low_exp = colSums(raw_counts[2:ncol(raw_counts)]<10),
+                )
+
+# adding metadata to sort by conditions
+qual_overview <- merge(qual_overview, sample_metadata, by = 0)
+
+# overview stats for samples from non-responders and responders
+stats_by_response <- qual_overview %>%
+  dplyr::group_by(response,) %>%
+  summarize(
+    NumSamples = n(),
+    MeanLibSize = mean(total_reads),
+    SDLibSize = sd(total_reads),
+    PropZeroExp = mean(zero_exp) / nrow(raw_counts),
+    PropLowExp = mean(low_exp) / nrow(raw_counts),
+  )
+
+# overview stats for samples from time point 1 and time point 2
+stats_by_time <- qual_overview %>%
+  dplyr::group_by(time_point,) %>%
+  summarize(
+    NumSamples = n(),
+    MeanLibSize = mean(total_reads),
+    SDLibSize = sd(total_reads),
+    PropZeroExp = mean(zero_exp) / nrow(raw_counts),
+    PropLowExp = mean(low_exp) / nrow(raw_counts),
+  )
+
+# merging tables and displaying
+stats_by_condition <- bind_rows(
+    stats_by_response %>% 
+        dplyr::mutate(group_type = "response") %>%
+        dplyr::rename(condition = response),
+    stats_by_time %>% 
+        dplyr::mutate(group_type = "time_point") %>%
+        dplyr::rename(condition = time_point)
+    )
+knitr::kable(stats_by_condition[,1:6], format = "html", align = "c")
+```
+
+Mean, standard deviation, and proportions of unexpressed and lowly expressed genes are similar across patient responder status and time, so special correction for data quality won't be necessary.
+
+# Identifier mapping and cleaning
+
+## Mapping to HUGO symbols
+
+The data uses Ensembl Gene IDs beginning with ENSG.
+
+```{r, message = FALSE, warning = FALSE, class.source = 'fold-show'}
+# get ensembl version 100 and the human gene dataset
+ensembl <- biomaRt::useEnsembl(biomart = "ensembl")
+ensembl <- biomaRt::useDataset("hsapiens_gene_ensembl", mart = ensembl)
+```
+
+Rather than Ensembl Gene IDs, we want to use HUGO Gene Nomenclature Committee (HGNC) symbols to identify the genes in our dataset. We'll use the Ensembl human dataset to map as many ENSG IDs as possible to HGNC symbols, and add those mappings to our read data.
+
+```{r, message = FALSE, warning = FALSE}
+# store ensembl IDs from the data as a vector
+ensembl_ids <- raw_counts$Geneid
+
+# check if an ensembl to hgnc conversion file exists already
+conversion_stash <- "ensembl_to_hgnc.rds"
+if (file.exists(conversion_stash)) {
+  
+  # if the file exists, read conversion data from that
+  ensembl_to_hgnc <- readRDS(conversion_stash)
+} else {
+  
+  # if the file does not exist, get conversion data from biomaRt and cache it
+  ensembl_to_hgnc <- biomaRt::getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
+                         filters = c("ensembl_gene_id"),
+                         values = ensembl_ids,
+                         mart = ensembl)
+  saveRDS(ensembl_to_hgnc, conversion_stash)
+}
+
+# merge conversion df with data and rearrange such that both id columns come before samples
+raw_counts_annot <- dplyr::left_join(raw_counts, ensembl_to_hgnc, 
+                                     by = c("Geneid" = "ensembl_gene_id"))
+raw_counts_cols <- dplyr::setdiff(names(raw_counts), "Geneid")
+colnames(raw_counts_annot)[1] = "ensembl_gene_id"
+raw_counts_annot <- raw_counts_annot[, c("ensembl_gene_id", "hgnc_symbol", raw_counts_cols)]
+
+# peek at annotated counts
+knitr::kable(raw_counts_annot[1:5, 1:10], format = "html", align = "c")
+```
+
+Now rows are identified by both ENSG ID and HGNC symbol.
+
+## Cleaning out low expression and unmapped rows
+
+Assaying for rows where mapping one ENSG ID to one HGNC symbol failed:
+
+```{r, message = FALSE, warning = FALSE}
+# subset rows where one ensembl id maps to multiple hgnc symbols
+ensembl_dups <- raw_counts_annot$ensembl_gene_id[duplicated(raw_counts_annot$ensembl_gene_id)]
+multiple_hgnc <- raw_counts_annot %>% 
+  filter(ensembl_gene_id %in% ensembl_dups)
+
+# subset rows where multiple ensembl ids map to one hgnc symbol
+hgnc_dups <- raw_counts_annot$hgnc_symbol[duplicated(raw_counts_annot$hgnc_symbol)]
+same_hgnc <- raw_counts_annot %>% 
+  filter(hgnc_symbol %in% hgnc_dups & hgnc_symbol != "")
+
+# subset rows where ensembl id does not map to a hgnc symbol 
+unmapped <- raw_counts_annot %>% 
+  filter(is.na(hgnc_symbol) | hgnc_symbol == "")
+
+cat(paste(nrow(unmapped), "unmapped rows\n",
+          nrow(multiple_hgnc), 
+          "rows where one ENSG ID maps to multiple HGNC symbols \n",
+          nrow(same_hgnc), 
+          "rows where multiple ENSG IDs map to the same HGNC symbol"))
+```
+
+A high proportion of the dataset's rows do not map to any HGNC symbol. These are likely to correspond to outdated aliases of current symbols, or deprecated ORFs. By filtering low expression genes from the data and comparing the proportions of mapped and unmapped genes that remain, we can assess the significance of the unmapped rows.
+
+```{r, message = FALSE, warning = FALSE, class.source = 'fold-show'}
+# size of smallest condition group in the dataset: non-responders at time point 1/2
+smallest_group_size <- 11
+
+# keep only unmapped rows that have a count of at least 10 in 11 samples
+rows_to_keep <- rowSums(unmapped >= 10) >= smallest_group_size
+clean_unmapped <- unmapped[rows_to_keep,]
+
+# subset mapped counts 
+mapped <- raw_counts_annot %>% 
+  filter(!is.na(hgnc_symbol) & hgnc_symbol != "")
+
+# apply same expression filter to mapped counts 
+rows_to_keep <- rowSums(mapped >= 10) >= smallest_group_size
+clean_mapped <- mapped[rows_to_keep,]
+
+# collate and display results of filtering
+cleaning_results <- data.frame(
+  Type = c("mapped genes", "unmapped genes"),
+  PreCleanCount = c(nrow(mapped), nrow(unmapped)),
+  PostCleanCount = c(nrow(clean_mapped), nrow(clean_unmapped)),
+  SignificantProportion = c(nrow(clean_mapped)/nrow(mapped), 
+                     nrow(clean_unmapped)/nrow(unmapped))
+)
+knitr::kable(cleaning_results, format = "html", align = "c")
+```
+
+Less than a tenth of the unmapped rows had sufficient levels of expression to not be filtered in early data cleaning, compared to more than a third of the mapped rows.
+
+Since unmapped rows are largely lowly expressed, we can discard them without losing a great amount of information. ENSG IDs mapping to multiple HGNC symbols may be transcripts that hybridize to more than one gene, and since they are in such small proportion in the dataset, we will treat them as multiple genes without significantly impacting analysis. HGNC symbols mapped to by multiple ENSG IDs may be genes with multiple splice variants. Since they are likewise in minuscule proportion in the dataset, we will sum together rows that map to the same HUGO gene.
+```{r, message = FALSE, warning = FALSE}
+# create a new dataframe where rows correspond to unique hgnc symbols
+clean_counts_byhgnc <- clean_mapped %>% 
+  dplyr::group_by(hgnc_symbol) %>% 
+  # sum rows that map to the same hgnc symbol
+  dplyr::summarise(dplyr::across(dplyr::where(is.numeric), ~ sum(.x, na.rm = TRUE)))
+
+knitr::kable(clean_counts_byhgnc[1:5, 1:10], format = "html", align = "c")
+```
+
+```{r, message = FALSE, warning = FALSE}
+cat(paste("Number of genes: ", nrow(clean_counts_byhgnc),
+          "\nNumber of samples: ", ncol(clean_counts_byhgnc)-1))
+```
+
+We now have a dataframe of read counts for genes with expression levels above a baseline, identified by unique HUGO symbols.
+
+# Normalization
+
+## Converting data for DESeq2
+
+Let's create a DESeqDataSet object from our data, and continue our analysis with the DESeq2 package, adapting methods from Love et al's RNASeq workflow [@Love2015].
+
+```{r, message = FALSE, warning = FALSE, class.source = 'fold-show'}
+# extract counts as a matrix and set row and column names
+clean_count_matrix <- as.matrix(clean_counts_byhgnc[,2:ncol(clean_counts_byhgnc)])
+rownames(clean_count_matrix) <- clean_counts_byhgnc$hgnc_symbol
+colnames(clean_count_matrix) <- colnames(clean_counts_byhgnc)[2:ncol(clean_counts_byhgnc)]
+
+#create a variable in the metadata from the interaction of response and time_point
+sample_metadata$group = interaction(sample_metadata$response, 
+                                      sample_metadata$time_point, 
+                                      sep = "_")
+
+# create a DESeqDataSet object from the counts matrix and the sample metadata, using the interaction of response and time point as the design. 
+counts_dds <- DESeq2::DESeqDataSetFromMatrix(countData = clean_count_matrix,
+                                             colData = sample_metadata,
+                                             design = ~group)
+```
+
+## Normalizing counts
+
+We'll implement relative log expression (RLE) normalization on the counts using the DESeq2 package. RLE normalization is based on the hypothesis that most genes are not differentially expressed, which is suitable for this dataset, as the associated publication identifies a low proportion of DE genes.
+
+```{r, message = FALSE, warning = FALSE, class.source = 'fold-show'}
+
+# estimate normalization factors and apply them to counts
+counts_dds <- DESeq2::estimateSizeFactors(counts_dds)
+norm_counts <- DESeq2::counts(counts_dds, normalized = TRUE)
+```
+
+## Plotting sample clustering
+
+In order to visualize the effects of normalization, we'll generate Multi-Dimensional Scaling (MDS) plots from the un-normalized and normalized data.
+
+```{r, message = FALSE, warning = FALSE}
+# create SummarizedExperiment objects with un-normalized and normalized counts
+unnorm_counts <- DESeq2::counts(counts_dds, normalized = FALSE)
+unnorm_counts_se <- SummarizedExperiment(assays = list(counts = unnorm_counts),
+                                         colData = sample_metadata)
+norm_counts_se <- SummarizedExperiment(assays = list(counts = norm_counts), 
+                                       colData = sample_metadata)
+
+# generate MDS data with un-normalized counts
+unnorm_mds <- edgeR::plotMDS.SummarizedExperiment(unnorm_counts_se, plot = FALSE)
+unnorm_mds_df <- data.frame(
+  Dim1 = unnorm_mds$x,
+  Dim2 = unnorm_mds$y,
+  Group = unnorm_counts_se$group,
+  Sample = colnames(unnorm_counts_se)
+)
+
+# generate MDS data with normalized counts
+norm_mds <- edgeR::plotMDS.SummarizedExperiment(norm_counts_se, plot = FALSE)
+norm_mds_df <- data.frame(
+  Dim1 = norm_mds$x,
+  Dim2 = norm_mds$y,
+  Group = norm_counts_se$group,
+  Sample = colnames(norm_counts_se)
+)
+
+# plot un-normalized MDS  
+ggplot2::ggplot(unnorm_mds_df, aes(x = Dim1, y = Dim2, color = Group)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(
+    x = paste("Dim1 (", round(unnorm_mds$var.explained[1]*100, 1), "%)"),
+    y = paste("Dim2 (", round(unnorm_mds$var.explained[2]*100, 1), "%)"),
+    title = "MDS plot: un-normalized counts"
+  )
+```
+
+<center>
+
+**Figure 1:** MDS plot generated from filtered RNA sequencing read counts of whole blood samples from septic shock patients who were responsive (R) and non-responsive (NR) to hemodynamic therapy, taken at time points before and after treatment (T1 and T2), without normalization.
+
+</center>
+
+```{r, message = FALSE, warning = FALSE}
+# plot normalized MDS
+ggplot2::ggplot(norm_mds_df, aes(x = Dim1, y = Dim2, color = Group)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(
+    x = paste("Dim1 (", round(norm_mds$var.explained[1]*100, 1), "%)"),
+    y = paste("Dim2 (", round(norm_mds$var.explained[2]*100, 1), "%)"),
+    title = "MDS plot: normalized counts"
+  )
+```
+
+<center>
+
+**Figure 2:** MDS plot generated from filtered RNA sequencing read counts of whole blood samples from septic shock patients who were responsive (R) and non-responsive (NR) to hemodynamic therapy, taken at time points before and after treatment (T1 and T2), normalized by relative log expression.
+
+</center>
+
+The MDS plots generated from the data pre and post normalization are nearly identical. The low impact of normalization indicates little technical bias in the dataset, and suggests that msot variation is biological 
+
+# Differential gene expression
+
+## Evaluating differential expression
+
+From Fig. 1 and Fig. 2, some grouping is visible of samples within the same set of conditions. Samples taken at the same time point from patients with the same response behaviour loosely cluster together. As such, we'll use the four combinations of response and time point as factors to evaluate differential expression.
+```{r, message = FALSE, warning = FALSE, class.source = 'fold-show'}
+# evaluate differential expression. Appropriate design already specified in counts_dds
+counts_dds <- DESeq2::DESeq(counts_dds)
+```
+We'll look for genes that are differentially expressed based on patient response at each of the two time points, and look for genes that are differentially expressed over time within each of the two patient response groups. 
+```{r, message = FALSE, warning = FALSE, results = 'hide', class.source = 'fold-show'}
+# DE between R and NR at T1
+response_T1 <- DESeq2::results(counts_dds, contrast = c("group", "NR_T1", "R_T1"), alpha = 0.05)
+summary(response_T1)
+
+# DE between R and NR at T2 
+response_T2 <- DESeq2::results(counts_dds, contrast = c("group", "NR_T2", "R_T2"), alpha = 0.05)
+summary(response_T2)
+
+# DE between T1 and T2 for NR patients
+time_NR <- DESeq2::results(counts_dds, contrast = c("group", "NR_T1", "NR_T2"), alpha =0.05)
+summary(time_NR)
+
+# DE between T1 and T2 for R patients
+time_R <- DESeq2::results(counts_dds, contrast = c("group", "R_T1", "R_T2"), alpha = 0.05)
+summary(time_R)
+```
+```{r, message = FALSE, warning = FALSE}
+# get genes with adjusted p-value < 0.05 for each test
+sig_T1 <- response_T1[response_T1$padj < 0.05,]
+sig_T2 <- response_T2[response_T2$padj < 0.05,]
+sig_NR <- time_NR[time_NR$padj < 0.05,]
+sig_R <- time_R[time_R$padj < 0.05,]
+
+cat(paste(nrow(sig_T1), "DE genes between R and NR at T1\n",
+          nrow(sig_T2), "DE genes between R and NR at T2\n",
+          nrow(sig_NR), "DE genes from T1 to T2 in NR\n",
+          nrow(sig_R), "DE genes from T1 to T2 in R"))
+```
+
+
+DESeq2 implements multiple hypothesis testing via Benjamini-Hochberg false discovery rate correction on p-values, producing adjusted p-values that more accurately reflect significance in bulk RNA-sequencing data than the original p-values given by the Wald test for differential expression. 
+The threshold we've used for differentially expressed genes is genes with adjusted p-value < 0.05, a commonly used threshold [cite cite]. 
+
+In this analysis, we'll work with the genes that were differentially expressed between the R and NR groups at T2. Since no genes are significantly differentially expressed between the R and NR groups at T1, analyzing the genes that are differentially expressed between the groups at T2 will tell us which genes were regulated differently between responder and non-responder patients as a result of the same conditions, yielding information on the differences between the two patient group's biological responses to the therapy.
+
+# Visualizing differentially expressed genes
+
+We'll create a volcano plot of the genes using the differential expression statistics calculated between the R and NR groups at T2.
+```{r, message = FALSE, warning = FALSE, class.source = 'fold-show'}
+# convert DE results to data frame
+difexp_info <- as.data.frame(response_T2)
+
+# add column indicating whether genes are significantly up or downregulated
+difexp_info$DE <- "no"
+difexp_info$DE[difexp_info$log2FoldChange > 0 & difexp_info$padj < 0.05] <- "up"
+difexp_info$DE[difexp_info$log2FoldChange < 0 & difexp_info$padj < 0.05] <- "down"
+
+# generate volcano plot, -log10 of adjusted p-val vs log2 of FC
+ggplot2::ggplot(data = difexp_info, mapping = aes(x = log2FoldChange, y = -log10(padj), col = DE)) + 
+  geom_point() +
+  theme_minimal() + 
+  geom_hline(yintercept = -log10(0.05), col = "black", linetype = 'dashed') + 
+  scale_color_manual(values = c("blue", "grey", "red"),
+                     labels = c("Downregulated in R group", "Not DE", "Upregulated in R group")) +
+  labs(color = "Expression", 
+       x = "log 2 fold change",
+       y = "log 10 corrected p-value",
+       title = "Expression of genes in R vs. NR samples at T2")
+
+```
+<center>
+
+**Figure 3:** FDR-corrected p-value (-log10) vs. fold change (log2) in expression of genes in whole blood samples from septic shock patients who responded to early supportive hemodynamic therapy (R samples) and patients who did not respond (NR), taken 48 hours after treatment. Threshold for differential expression was corrected p-value < 0.05.
+
+</center>
+
+Next, we'll create a heatmap of the genes differentially expressed between the R and NR groups at T2, and see how they cluster according to sample conditions.
+```{r, message = FALSE, warning = FALSE, class.source = 'fold-show'}
+# use normalized counts for heatmap matrix, filter for DE genes
+normcounts_heatmap <- norm_counts[rownames(norm_counts) %in% rownames(sig_T2),]
+
+# normalize rows
+normcounts_heatmap <- t(scale(t(normcounts_heatmap)))
+
+# set colours to scale from blue at min values to white at 0 to red at max values
+heatmap_col = circlize::colorRamp2(c(min(normcounts_heatmap), 0, max(normcounts_heatmap)),
+                                   c("blue", "white", "red"))
+
+# set colours to correspond to experimental conditions
+group_colours <- rainbow(n = 4)
+names(group_colours) <- unique(sample_metadata$group)
+
+# add annotation with experimental conditions and corresponding colours
+hannot <- ComplexHeatmap::HeatmapAnnotation(df = data.frame(
+  Group = sample_metadata$group),
+  col = list(
+    Group = group_colours
+  ),
+show_legend = TRUE)
+
+# generate heatmap
+DE_heatmap <- ComplexHeatmap::Heatmap(normcounts_heatmap, 
+                                   col = heatmap_col,
+                                   show_column_names = FALSE,
+                                   show_row_names = FALSE,
+                                   top_annotation = hannot,
+                                   show_heatmap_legend = FALSE,
+                                   column_title = "Genes differentially expressed in R vs. NR groups at T1")
+
+DE_heatmap
+```
+<center>
+
+**Figure 4:** Heatmap of genes differentially expressed in septic shock patients who responded to hemodynamic therapy and patients who did not respond 48 hours after treatment (groups R_T2 and NR_T2, respectively). Blue denotes low gene expression and red denotes high gene expression.
+
+</center>
+
+The R_T2 and NR_T2 samples largely clustered apart from each other, while the R_T1 and NR_T1 samples are not. This is as expected, since the genes being plotted are differentially expressed between R and NR at T2, while no genes are differentially expressed between R and NR at T1. There is also significant separation between the T1 and T2 groups for R, but not for NR, indicating that many of these genes change in expression in responders over the 48 hours after hemodynamic therapy, but not in non-responders.
+
+# Interpretation and documentation
+* This dataset was of interest because the distinct conditions within it are not a result of differential treatment or circumstances, but of differential biological response to a treatment, and the inclusion of two different time points means that the dataset can be used to analyze how pre-existing biological differences lead to different epigenetic responses.
+
+* In this dataset, the control condition is patients who were non-responders to early supportive hemodynamic therapy as treatment for septic shock and the test condition is patients who were responders. Samples collected at ICU admission also serve as a control for samples collected 48h later.
+
+* There are 34 samples from responders and 28 samples from non responders. There are 32 samples taken at time point 1 and 32 sample staken at time point 2.
+
+* There were expression values that were not unique for specific genes, but they were a very small proportion of the data. When multiple expression values mapped to one gene, we used their sum as the expression value for that gene. When an expression value mapped to multiple genes, we duplicated it and used it as the expression value for each gene it mapped to. Since there were very few such cases, the impact of this transformation on library size was negligible. 
+
+* A large proportion of the expression values could not be mapped to HUGO symbols, but most of the unmapped values were very low, and were removed when filtering out low expression genes. 
+
+* There were no outliers in the dataset, according to the threshold on Cook's distance applied by DESeq2. 
+
+* Biological replicates were grouped together in the design model used for differential expression analysis. There were no technical replicates.
+
+* The dataset covers 13673 genes across 62 samples.
+
+# Bibliography
